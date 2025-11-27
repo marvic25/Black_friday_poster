@@ -1,0 +1,6 @@
+Pillow>=9.0
+Babel>=2.12
+Flask>=2.0
+img2pdf>=0.4
+# Optional: WeasyPrint can produce high-quality vector PDFs but needs system dependencies
+# weasyprint>=58.0

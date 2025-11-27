@@ -1,0 +1,14 @@
+# Ignorar ambiente virtual
+venv/
+__pycache__/
+
+# Ignorar arquivos gerados (para não sujar o histórico)
+*.png
+*.pdf
+
+# Ignorar uploads temporários
+uploads/
+
+# Ignorar ficheiros do sistema
+.DS_Store
+Thumbs.db
