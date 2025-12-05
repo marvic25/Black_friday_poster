@@ -1,4 +1,6 @@
 import os
+import tempfile
+import uuid
 from PIL import Image, ImageDraw, ImageFont
 
 # --- CONFIGURAÇÕES VISUAIS ---
@@ -269,9 +271,123 @@ def desenhar_lista_produtos(draw, ofertas, W, H, margin, y_start, y_end, text_co
             draw.line((x_de, y_de + f_price_lbl/2, x_anchor, y_de + f_price_lbl/2), fill=badge_color, width=2)
 
 
+def desenhar_lista_simples(draw, ofertas, W, H, margin, y_start, y_end, text_color, accent_color, badge_color):
+    """
+    Layout simples: lista com nome do produto (esquerda) e preço final (direita).
+    Pensado para até 12 itens por folha — usa fonte maior e limpa.
+    """
+    qtd = len(ofertas) if len(ofertas) > 0 else 1
+    available_h = y_end - y_start
+    row_height = available_h / qtd
+
+    # Coluna nome ocupa ~70% da largura
+    usable_width = W - (margin * 2)
+    col_name_w = usable_width * 0.70
+
+    # Fontes: nome e preço
+    font_name_size = max(14, int(row_height * 0.35))
+    font_price_size = max(14, int(row_height * 0.45))
+    font_name = get_font(font_name_size, bold=False)
+    font_price = get_font(font_price_size, bold=True)
+
+    for i, item in enumerate(ofertas):
+        y_pos = y_start + (i * row_height)
+        y_center = y_pos + (row_height / 2)
+
+        # Alterna leve cor de fundo para leitura
+        if i % 2 == 0:
+            draw.rectangle([margin, y_pos, W - margin, y_pos + row_height], fill=(20, 20, 20))
+
+        prod_raw = item.get('produto', '').strip()
+        por = item.get('por', 0.0)
+
+        # Quebra o nome na largura disponível, reduzindo fonte se necessário
+        max_h_text = row_height * 0.9
+        lines, font_final, total_h, line_h = caber_texto_na_caixa(
+            draw, prod_raw.upper(), col_name_w, max_h_text, font_name_size, is_bold=False
+        )
+
+        y_cursor = y_pos + (row_height - total_h) / 2
+        for line in lines:
+            draw.text((margin + 10, y_cursor), line, font=font_final, fill=accent_color)
+            y_cursor += line_h
+
+        # Preço final alinhado à direita
+        price_text = formatar_moeda(por)
+        w_price = draw.textlength(price_text, font=font_price)
+        x_price = W - margin - 10 - w_price
+        y_price = y_center - (font_price_size / 2)
+        draw.text((x_price, y_price), price_text, font=font_price, fill=text_color)
+
+
+def desenhar_gondola(draw, ofertas, W, H, margin, y_start, y_end, text_color, accent_color, badge_color):
+    """
+    Gôndola / Cartazete: 8 por página em grid 2x4.
+    Cada item ocupa um 'cartazete' com nome (esquerda/alto) e preço (direita/baixo) legível.
+    """
+    cols = 2
+    rows = 4
+    gap = max(8, int(W * 0.02))
+
+    usable_w = W - (margin * 2) - (gap * (cols - 1))
+    card_w = usable_w / cols
+    usable_h = (y_end - y_start) - (gap * (rows - 1))
+    card_h = usable_h / rows
+
+    # Fonte base aproximada
+    for idx, item in enumerate(ofertas[:cols * rows]):
+        r = idx // cols
+        c = idx % cols
+
+        x0 = margin + c * (card_w + gap)
+        y0 = y_start + r * (card_h + gap)
+        x1 = int(x0 + card_w)
+        y1 = int(y0 + card_h)
+
+        # Card background (slightly lighter to separate)
+        draw.rectangle([x0, y0, x1, y1], fill=(18, 18, 18))
+
+        padding = 8
+
+        # Nome produto (usa até 60% da largura do cartazete)
+        name_w = (card_w - padding * 2) * 0.65
+        name_max_h = card_h * 0.55
+        name_font_start = max(12, int(card_h * 0.16))
+        prod_raw = item.get('produto', '').upper()
+        lines, font_final, total_h, line_h = caber_texto_na_caixa(
+            draw, prod_raw, name_w, name_max_h, name_font_start, is_bold=False
+        )
+
+        y_cursor = y0 + padding + (name_max_h - total_h) / 2
+        for line in lines:
+            draw.text((x0 + padding, y_cursor), line, font=font_final, fill=accent_color)
+            y_cursor += line_h
+
+        # Preço grande alinhado à direita/bottom do cartazete
+        por = item.get('por', 0.0)
+        price_font_size = max(14, int(card_h * 0.28))
+        font_price = get_font(price_font_size, bold=True)
+        price_text = formatar_moeda(por)
+        w_price = draw.textlength(price_text, font=font_price)
+        px = x1 - padding - w_price
+        py = y1 - padding - price_font_size
+        draw.text((px, py), price_text, font=font_price, fill=text_color)
+
+        # DE (se existir) pequeno acima do preço
+        de = item.get('de', 0.0)
+        if de > por:
+            font_de = get_font(max(10, int(price_font_size * 0.45)), bold=True)
+            de_text = f"DE: {formatar_moeda(de)}"
+            w_de = draw.textlength(de_text, font=font_de)
+            dx = x1 - padding - w_de
+            dy = py - (font_de.size if hasattr(font_de, 'size') else price_font_size * 0.5) - 4
+            draw.text((dx, dy), de_text, font=font_de, fill=badge_color)
+
+
 def gerar_poster_a_partir_de_lista(ofertas, vigencia_text=None, aviso_estoques=None, 
                                    print_margin=None, dpi=None, bleed_mm=None,
-                                   bg_color=None, text_color=None, accent_color=None, badge_color=None):
+                                   bg_color=None, text_color=None, accent_color=None, badge_color=None,
+                                   layout_mode='list', poster_title="OFERTAS"):
     
     DPI = dpi or 150
     W = int((210 * DPI) / 25.4)
@@ -303,23 +419,43 @@ def gerar_poster_a_partir_de_lista(ofertas, vigencia_text=None, aviso_estoques=N
         draw.text(((W - w_line)/2, y_foot), line, font=font_foot, fill=c_accent)
         y_foot += line_h_foot
 
-    # 2. CABEÇALHO
+    # 2. CABEÇALHO (com ajuste automático de título)
     h_header = int(H * 0.12)
-    font_head = get_font(h_header * 0.6, bold=True)
-    title = "BLACK FRIDAY"
-    w_head = draw.textlength(title, font=font_head)
-    draw.text(((W - w_head)/2, margin), title, font=font_head, fill=c_text)
+    y_header_start = margin
+
+    max_w_title = W - (margin * 2)
+    max_h_title = h_header
+    start_font_size_title = int(h_header * 0.7) # Start with a large font
+
+    # Usa a função inteligente para ajustar o título (quebra linhas e reduz fonte)
+    title_lines, title_font, title_total_h, title_line_h = caber_texto_na_caixa(
+        draw, poster_title.upper(), max_w_title, max_h_title, start_font_size_title, is_bold=True
+    )
+    
+    # Desenha o título centralizado (horizontal e verticalmente na área do cabeçalho)
+    y_cursor = y_header_start + (max_h_title - title_total_h) / 2
+    for line in title_lines:
+        w_line = draw.textlength(line, font=title_font)
+        x_line = (W - w_line) / 2
+        draw.text((x_line, y_cursor), line, font=title_font, fill=c_text)
+        y_cursor += title_line_h
 
     # 3. ÁREA ÚTIL
     y_start = margin + h_header
     y_end = H - margin - total_h_foot - 20
     
-    if len(ofertas) == 1:
+    # Escolhe o layout de desenho de acordo com o modo solicitado
+    if layout_mode == 'individual' or len(ofertas) == 1:
         desenhar_item_individual(draw, ofertas[0], W, H, margin, y_start, y_end, c_text, c_accent, c_badge)
+    elif layout_mode == 'simple':
+        desenhar_lista_simples(draw, ofertas, W, H, margin, y_start, y_end, c_text, c_accent, c_badge)
+    elif layout_mode == 'gondola':
+        desenhar_gondola(draw, ofertas, W, H, margin, y_start, y_end, c_text, c_accent, c_badge)
     else:
         desenhar_lista_produtos(draw, ofertas, W, H, margin, y_start, y_end, c_text, c_accent, c_badge)
 
-    out_filename = f"poster_gen.png"
-    out_path = os.path.join(os.path.dirname(__file__), out_filename)
+    # Salva a imagem em um arquivo temporário único para evitar conflitos
+    out_filename = f"poster_{uuid.uuid4()}.png"
+    out_path = os.path.join(tempfile.gettempdir(), out_filename)
     img.save(out_path)
     return out_path

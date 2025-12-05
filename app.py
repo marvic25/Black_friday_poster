@@ -1,9 +1,11 @@
-from flask import Flask, render_template, request, send_file, redirect, url_for, flash
+from flask import Flask, render_template, request, send_file, redirect, url_for, flash, after_this_request
+import io
 from werkzeug.utils import secure_filename
 import os
 import csv
 import tempfile
 import shutil
+import zipfile
 
 # Tenta importar img2pdf para gerar o arquivo multipágina
 try:
@@ -23,6 +25,28 @@ from poster_black import (
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('FLASK_SECRET', 'dev-secret')
+
+# --- Definição de Temas ---
+THEMES = {
+    'blackfriday': {
+        'bg': '#000000',
+        'text': '#ffff00',
+        'accent': '#ffffff',
+        'badge': '#ff0000'
+    },
+    'natalino': {
+        'bg': '#0a3a0a',
+        'text': '#ffffff',
+        'accent': '#ffcc00',
+        'badge': '#ff0000'
+    },
+    'farmacia': {
+        'bg': '#ffffff',
+        'text': '#cc0000',
+        'accent': '#ffcc00',
+        'badge': '#cc0000'
+    }
+}
 
 # --- Funções Auxiliares ---
 
@@ -137,6 +161,12 @@ def index():
         
         if layout_mode == 'individual':
             itens_por_pagina = 1
+        elif layout_mode == 'simple':
+            # Lista simples: pode conter até 12 produtos por página
+            itens_por_pagina = 12
+        elif layout_mode == 'gondola':
+            # Gôndola / cartazete: 8 por página
+            itens_por_pagina = 8
         else:
             try:
                 qtd_input = int(request.form.get('qtd_itens', 6))
@@ -149,72 +179,168 @@ def index():
         # Parâmetros visuais
         vigencia_text = request.form.get('vigencia', '').strip() or None
         aviso_estoques = request.form.get('estoques', '').strip() or None
+        poster_title = request.form.get('poster_title', 'OFERTAS')
         
-        # Cores
+        # Cores: usa o form, que já foi preenchido pelo JS do tema
         bg_color = request.form.get('bg_color')
         text_color = request.form.get('text_color')
         accent_color = request.form.get('accent_color')
         badge_color = request.form.get('badge_color')
 
-        # 4. GERAÇÃO EM LOTE (Paginação Automática)
-        temp_images = []
+        # 4. GERAÇÃO EM LOTE E LIMPEZA DE ARQUIVOS
+        files_to_cleanup = []
         try:
-            # Aqui acontece a mágica: se tiver 20 itens e limite 5, cria 4 grupos
-            grupos = list(dividir_lista(ofertas, itens_por_pagina))
-            
-            for idx, grupo in enumerate(grupos):
-                path = gerar_poster_a_partir_de_lista(
-                    grupo, 
-                    vigencia_text=vigencia_text, 
-                    aviso_estoques=aviso_estoques, 
-                    bg_color=bg_color, 
-                    text_color=text_color, 
-                    accent_color=accent_color, 
-                    badge_color=badge_color
-                )
-                # Renomeia para garantir ordem (page_01.png, page_02.png)
-                new_path = path.replace('.png', f'_pg{idx}.png')
-                shutil.move(path, new_path)
-                temp_images.append(new_path)
+            # Registra uma função para limpar todos os arquivos temporários (PNGs, PDF, ZIP)
+            # depois que a requisição for concluída com sucesso.
+            @after_this_request
+            def cleanup_files(response):
+                for f in files_to_cleanup:
+                    try:
+                        if os.path.exists(f):
+                            os.remove(f)
+                    except Exception as e:
+                        # Idealmente, logar esse erro em um sistema de logging
+                        app.logger.error(f"Falha ao limpar arquivo temporário {f}: {e}")
+                return response
 
-            # 5. Saída (PDF ou PNG)
+            # Geração das imagens PNG para cada página
+            temp_images = []
+            grupos = list(dividir_lista(ofertas, itens_por_pagina))
+            for grupo in grupos:
+                path = gerar_poster_a_partir_de_lista(
+                    grupo,
+                    vigencia_text=vigencia_text,
+                    aviso_estoques=aviso_estoques,
+                    bg_color=bg_color,
+                    text_color=text_color,
+                    accent_color=accent_color,
+                    badge_color=badge_color,
+                    layout_mode=layout_mode,
+                    poster_title=poster_title,
+                )
+                temp_images.append(path)
+            
+            # Adiciona os PNGs gerados à lista de limpeza
+            files_to_cleanup.extend(temp_images)
+
+            # Se for uma pré-visualização, sempre retorna a primeira imagem (PNG)
+            if request.form.get("action") == "preview":
+                # Lê em memória e envia para liberar o arquivo no Windows
+                from io import BytesIO
+                with open(temp_images[0], 'rb') as f:
+                    data = f.read()
+                buf = BytesIO(data)
+                buf.seek(0)
+                return send_file(buf, mimetype='image/png')
+
+            # 5. Saída (PDF, PNG ou ZIP)
             # Se for só 1 página e o usuário pediu PNG/Preview
-            if len(temp_images) == 1 and request.form.get('format') != 'pdf':
-                if request.form.get('action') == 'preview':
-                    return send_file(temp_images[0], mimetype='image/png')
-                return send_file(temp_images[0], as_attachment=True)
+            if len(temp_images) == 1 and request.form.get("format") != "pdf":
+                image_to_send = temp_images[0]
+                if request.form.get("action") == "preview":
+                    from io import BytesIO
+                    with open(image_to_send, 'rb') as f:
+                        data = f.read()
+                    buf = BytesIO(data)
+                    buf.seek(0)
+                    return send_file(buf, mimetype='image/png')
+                # Para download, também envia em memória para permitir remoção do arquivo
+                from io import BytesIO
+                with open(image_to_send, 'rb') as f:
+                    data = f.read()
+                buf = BytesIO(data)
+                buf.seek(0)
+                return send_file(buf, as_attachment=True, download_name=os.path.basename(image_to_send))
 
             # Se for PDF (ou múltiplas páginas que obrigam PDF)
-            if not img2pdf:
-                flash('Erro: img2pdf não instalado para gerar múltiplas páginas.')
-                return redirect(url_for('index'))
+            # Tenta gerar PDF primeiro (img2pdf é preferencial pela qualidade)
+            if img2pdf:
+                fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+                os.close(fd)
+                files_to_cleanup.append(pdf_path) # Adiciona à lista de limpeza
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+                # Converte as imagens e salva no arquivo PDF
                 pdf_bytes = img2pdf.convert(temp_images)
-                tmp_pdf.write(pdf_bytes)
-                pdf_path = tmp_pdf.name
+                with open(pdf_path, "wb") as f:
+                    f.write(pdf_bytes)
 
-            # Limpeza das imagens
-            for img in temp_images:
-                if os.path.exists(img): os.remove(img)
+                # Envia o PDF em memória para permitir remoção do arquivo no Windows
+                with open(pdf_path, 'rb') as f:
+                    pdf_data = f.read()
+                buf_pdf = io.BytesIO(pdf_data)
+                buf_pdf.seek(0)
+                return send_file(buf_pdf, as_attachment=True, download_name="cartazes_ofertas.pdf", mimetype='application/pdf')
 
-            return send_file(pdf_path, as_attachment=True, download_name='cartazes_ofertas.pdf')
+            # Se img2pdf não estiver disponível, tenta criar PDF com Pillow (PIL)
+            try:
+                from PIL import Image
+
+                # Abre imagens e converte para RGB (requisito para salvar em PDF)
+                pil_imgs = [Image.open(p).convert("RGB") for p in temp_images]
+
+                fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+                os.close(fd)
+                files_to_cleanup.append(pdf_path)
+
+                # Salva multipage PDF usando PIL
+                if len(pil_imgs) == 1:
+                    pil_imgs[0].save(pdf_path, format="PDF", resolution=150)
+                else:
+                    pil_imgs[0].save(pdf_path, format="PDF", save_all=True, append_images=pil_imgs[1:], resolution=150)
+
+                # Envia o PDF em memória para permitir remoção do arquivo no Windows
+                with open(pdf_path, 'rb') as f:
+                    pdf_data = f.read()
+                buf_pdf = io.BytesIO(pdf_data)
+                buf_pdf.seek(0)
+                return send_file(buf_pdf, as_attachment=True, download_name="cartazes_ofertas.pdf", mimetype='application/pdf')
+            except Exception:
+                # Último recurso: empacotar imagens em ZIP
+                fd, zip_path = tempfile.mkstemp(suffix=".zip")
+                os.close(fd)
+                files_to_cleanup.append(zip_path)
+
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for img in temp_images:
+                        arcname = os.path.basename(img)
+                        zf.write(img, arcname=arcname)
+
+                flash("Não foi possível gerar PDF (tentadas img2pdf e PIL) — fornecendo ZIP com as imagens geradas.")
+                # Envia o ZIP em memória
+                with open(zip_path, 'rb') as f:
+                    zip_data = f.read()
+                buf_zip = io.BytesIO(zip_data)
+                buf_zip.seek(0)
+                return send_file(buf_zip, as_attachment=True, download_name="cartazes_ofertas.zip", mimetype='application/zip')
 
         except Exception as e:
-            flash(f"Erro ao processar: {e}")
-            return redirect(url_for('index'))
+            # Em caso de erro, faz a limpeza manualmente, pois o hook @after_this_request não será executado.
+            for f in files_to_cleanup:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                except Exception as e_clean:
+                    app.logger.error(f"Falha ao limpar arquivo temporário {f} durante tratamento de erro: {e_clean}")
+            
+            app.logger.error(f"Erro ao processar a geração do poster: {e}", exc_info=True)
+            flash(f"Erro ao processar: {str(e)}")
+            return redirect(url_for("index"))
 
     defaults = {
         'offers': default_offers,
         'vigencia_default': TEXTO_VIGENCIA,
         'estoque_default': TEXTO_ESTOQUES,
         'margin_default': PRINT_MARGIN,
-        'bg_default': rgb_to_hex(DEFAULT_BG),
-        'text_default': rgb_to_hex(DEFAULT_TEXT),
-        'accent_default': rgb_to_hex(DEFAULT_ACCENT)
+        'bg_default': THEMES['blackfriday']['bg'],
+        'text_default': THEMES['blackfriday']['text'],
+        'accent_default': THEMES['blackfriday']['accent'],
+        'badge_default': THEMES['blackfriday']['badge'],
+        'themes': THEMES
     }
 
     return render_template('index.html', **defaults)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5050)
+& ".\.venv\Scripts\Activate.ps1"
+& ".\.venv\Scripts\python.exe" app.py
